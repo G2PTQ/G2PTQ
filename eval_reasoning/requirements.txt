@@ -1,0 +1,9 @@
+vllm==0.29.0
+evalscope==1.11.1
+modelscope==1.40.0
+PyYAML==6.0.2
+emoji==2.15.0
+syllapy==0.8.0
+nltk==3.10.3
+lm-eval==0.4.4
+tenacity==9.1.2

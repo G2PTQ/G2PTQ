@@ -1,0 +1,25 @@
+#!/bin/bash
+
+# Input arguments
+MODEL_PATH=${1}     # ./modelzoo/Qwen3/Qwen3-0.6B
+DEVICE=${2}         # 0
+
+MODEL_NAME=$(basename ${MODEL_PATH})
+N_SAMPLES=1024
+SEQ_LEN=2048
+
+FIRST_DEVICE=$(echo "${DEVICE}" | cut -d',' -f1)
+NPROC=$(echo "${DEVICE}" | awk -F',' '{print NF}')
+
+# Set environment variables
+export CUDA_VISIBLE_DEVICES=${DEVICE}
+
+# Execute the script
+python -m torch.distributed.run \
+    --nnodes=1 --nproc_per_node=${NPROC} --rdzv_endpoint=localhost:2940${FIRST_DEVICE} ./save_grads.py \
+    --model ${MODEL_PATH} \
+    --exp save_grads \
+    --mode gradients \
+    --dataset neuralmagic --nsamples ${N_SAMPLES} --seq_len ${SEQ_LEN} \
+    --num_groups 4 \
+    --rotate \
