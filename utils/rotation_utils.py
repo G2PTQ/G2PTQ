@@ -163,6 +163,8 @@ def rotate_model(args, analyzer: model_utils.ModelAnalyzer):
                 dist.broadcast(R2, src=0)
             rotate_ov_proj(analyzer, layer, R2=R2)
 
+    return R1
+
 
 class QKRotationWrapper(torch.nn.Module):
     def __init__(self, func, head_dim, *args, **kwargs):

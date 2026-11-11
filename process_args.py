@@ -53,6 +53,7 @@ def parse_gen():
     parser.add_argument("--ignore_attn", action="store_true", help="Keep attention modules in high-precision")
     parser.add_argument("--export_compressed_tensors", action="store_true", help="Export quantized model to compressed-tensors format")
     parser.add_argument("--export_mtp", action="store_true", help="Export MTP weights to compressed-tensors format")
+    parser.add_argument("--export_mtp_head", action="store_true", help="Export MTP with an independent mtp.lm_head (decoupled copy of the main lm_head, rotated with the MTP)")
     # Rotate
     parser.add_argument("--optimized_rotation_path", type=str, default=None, help="The path to rotation ckpt")
     parser.add_argument("--rotate", action="store_true", help="Rotate model (SpinQuant)")

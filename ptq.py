@@ -33,8 +33,9 @@ def main(args):
         ref_logits_dict[eval_dataset] = ref_logits
 
     # Rotate the weights
+    R1 = None
     if args.rotate:
-        rotation_utils.rotate_model(args, analyzer)
+        R1 = rotation_utils.rotate_model(args, analyzer)
         memory_utils.cleanup_memory()
 
         quant_utils.add_actquant(analyzer)  # Add Activation Wrapper to the model
@@ -143,6 +144,8 @@ def main(args):
             group_size=args.w_groupsize,
             sym=not args.w_asym,
             export_mtp=args.export_mtp,
+            export_mtp_head=args.export_mtp_head,
+            mtp_rotation=R1,
         )
 
 

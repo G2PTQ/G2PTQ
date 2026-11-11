@@ -10,6 +10,8 @@ from compressed_tensors.quantization import QuantizationConfig, QuantizationSche
 from compressed_tensors.compressors import pack_to_int32
 from compressed_tensors.utils import save_mtp_tensors_to_checkpoint
 
+from utils import mtp_utils
+
 
 MERGE_PATTERNS = {
     "qkv_proj": r"(q_proj|k_proj|v_proj)",
@@ -54,12 +56,12 @@ def register_qparam_buffers(modules):
 
 
 def expand_ignore_list(
-    ignore_list: list[str], 
+    ignore_list: list[str],
     merge_patterns: dict[str, str] = None
 ) -> list[str]:
     """
     Expands the ignore list to include merged layers for inference engine compatibility.
-    
+
     Args:
         ignore_list: The original list of layers to ignore.
         merge_patterns: A dictionary mapping merged layer names to regex patterns.
@@ -68,27 +70,29 @@ def expand_ignore_list(
         merge_patterns = MERGE_PATTERNS
 
     expanded_ignores = set(ignore_list)
-    
+
     for layer in ignore_list:
         for merged_name, pattern in merge_patterns.items():
             if re.search(pattern, layer):
                 merged_layer = re.sub(pattern, merged_name, layer)
                 expanded_ignores.add(merged_layer)
-                
+
     return sorted(list(expanded_ignores))
 
 
 def save_to_compressed_tensors(
     source_model: str,
     config: PreTrainedConfig,
-    model: PreTrainedModel, 
+    model: PreTrainedModel,
     tokenizer: PreTrainedTokenizer,
     processor: ProcessorMixin,
-    save_path: str, 
-    bits: int = 4, 
-    group_size: int = 128, 
+    save_path: str,
+    bits: int = 4,
+    group_size: int = 128,
     sym: bool = True,
     export_mtp: bool = False,
+    export_mtp_head: bool = False,
+    mtp_rotation: torch.Tensor | None = None,
 ):
     """Save a GPTQ quantized model to the compressed-tensors format.
     """
@@ -135,7 +139,7 @@ def save_to_compressed_tensors(
         quant_method="compressed-tensors",
         quantization_status="compressed",
     )
-    
+
     # Attach config to the model
     if hasattr(config, "quantization_config"):
         delattr(config, "quantization_config")
@@ -154,3 +158,16 @@ def save_to_compressed_tensors(
     )
     if export_mtp:
         save_mtp_tensors_to_checkpoint(source_model=source_model, dest_dir=save_path)
+        # Optional: add an independent mtp.lm_head (raw main lm_head) so that
+        # mtp.norm can later be fused into it by rotate_mtp_file. This is only
+        # needed when the MTP must carry its own lm_head.
+        if export_mtp_head:
+            mtp_utils.add_mtp_lm_head_to_shard(save_path, source_model)
+            # Rotate the MTP weights together with the main model rotation R1
+            # only when the independent head is present: the fused mtp.norm
+            # scale (1+w_n) must be absorbed by the head (W_head*diag(1+w_n)*R1).
+            # Without the head the MTP is exported as-is, whether or not the
+            # main model was rotated. R1 is the rotation returned by
+            # rotation_utils.rotate_model (None when --rotate is not used).
+            if mtp_rotation is not None:
+                mtp_utils.rotate_mtp_file(save_path, mtp_rotation)
