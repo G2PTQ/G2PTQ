@@ -273,6 +273,7 @@ def kl_ppl_eval(args, analyzer, orig_lm_head, test_loader_dict, ref_logits_dict)
         logging.info(f"KL&PPL&EAR on {eval_dataset}: {kl_loss:.2e}, {ppl:.2f}, {ear:.4f}")
     assert_metric_vals_synced(metric_vals)
     pretty_print_results(metric_vals)
+    return metric_vals
 
 
 def qa_eval(model, tokenizer, lm_eval_batch_size=32):

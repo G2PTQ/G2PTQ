@@ -1,4 +1,6 @@
 import os
+from gptq_utils.bits_map import all_bit_widths, describe
+from gptq_utils import token_weights
 import time
 import math
 import logging
@@ -17,7 +19,7 @@ def quantize_weights(args, analyzer: model_utils.ModelAnalyzer):
 
     model = analyzer.model
 
-    if args.w_bits < 16:
+    if min(all_bit_widths(args)) < 16:
         save_dict = {}
         if args.load_qmodel_path:  # Load Quantized Rotated Model
             logging.info("Load quantized model from ", args.load_qmodel_path)
@@ -28,13 +30,25 @@ def quantize_weights(args, analyzer: model_utils.ModelAnalyzer):
             trainloader = data_utils.get_tokens(args.dataset, "train", analyzer.tokenizer, args.seq_len,
                                                 args.nsamples, args.tokens_cache_path, args.seed)
             
+            logging.info(f"Weight quantization settings: {describe(args)}")
+
             # Split dataset
+            start, end = 0, len(trainloader)
             if dist_utils.is_dist_available_and_initialized():
                 rank = dist_utils.get_rank()
                 world_size = dist_utils.get_world_size()
                 start = math.floor(args.nsamples * (rank / world_size))
                 end = math.floor(args.nsamples * ((rank + 1) / world_size))
-                trainloader = trainloader[start: end]
+
+            # Token importance weights (Idea 2): verified against the full token set, then
+            # sliced exactly like the calibration data.
+            token_weights.reset()
+            if getattr(args, "token_weights", None):
+                if analyzer.is_moe():
+                    raise NotImplementedError("--token_weights supports dense models only")
+                token_weights.load(args.token_weights, trainloader, start, end)
+
+            trainloader = trainloader[start: end]
 
             if isinstance(trainloader[0], torch.Tensor):
                 assert trainloader[0].dim() == 1
@@ -66,6 +80,12 @@ def quantize_weights(args, analyzer: model_utils.ModelAnalyzer):
             logging.info(f"Model Quantization Time: {((end_time - start_time) / 3600):.2f} hours")
             logging.info(f"Peak GPU Memory Usage during Model Quantization: {peak_gpu_mem:.2f} GB")
             logging.info(f"Peak CPU Memory Usage during Model Quantization: {peak_cpu_mem:.2f} GB")
+            args.quant_stats = {
+                "quant_time_hours": (end_time - start_time) / 3600,
+                "peak_gpu_mem_gb": peak_gpu_mem,
+                "peak_cpu_mem_gb": peak_cpu_mem,
+            }
+            token_weights.reset()
             save_dict["w_quantizers"] = quantizers
 
         if args.save_qmodel_path and dist_utils.is_main():

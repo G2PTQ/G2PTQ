@@ -1,4 +1,6 @@
+import json
 import logging
+import os
 
 import torch
 from compressed_tensors.offload.module import remove_module_offload
@@ -114,7 +116,9 @@ def main(args):
         model = quantize_weights(args, analyzer)
 
     # Eval
-    eval_utils.kl_ppl_eval(args, analyzer, orig_lm_head, test_loader_dict, ref_logits_dict)
+    metric_vals = eval_utils.kl_ppl_eval(args, analyzer, orig_lm_head, test_loader_dict, ref_logits_dict)
+    if dist_utils.is_main():
+        write_metrics(args, metric_vals)
     del orig_lm_head, ref_logits_dict
     memory_utils.cleanup_memory()
     if dist_utils.is_main():
@@ -122,6 +126,9 @@ def main(args):
         offload_utils.set_onload_device(model, torch.device("cpu"))
         for module in model.modules():
             remove_module_offload(module, onload_tensors=True)
+
+        if args.save_dequant_model:
+            save_dequant_model(args, analyzer)
 
         if args.lm_eval:
             dist_utils.distribute_model(analyzer)
@@ -144,6 +151,53 @@ def main(args):
             sym=not args.w_asym,
             export_mtp=args.export_mtp,
         )
+
+
+def write_metrics(args, metric_vals):
+    """Write KL/PPL/EAR plus run settings to <output_dir>/metrics.json (read by ours/eval/collect_results.py)."""
+    from gptq_utils.bits_map import describe
+    record = {
+        "exp": args.exp,
+        "model": args.model,
+        "w_method": args.w_method,
+        "w_bits": args.w_bits,
+        "w_groupsize": args.w_groupsize,
+        "w_bits_map": describe(args),
+        "w_bits_map_json": ({r.pattern: ({"bits": b, "groupsize": g} if g is not None else b)
+                             for r, b, g in args.w_bits_map} if args.w_bits_map else None),
+        "dataset": args.dataset,
+        "nsamples": args.nsamples,
+        "seq_len": args.seq_len,
+        "token_weights": args.token_weights,
+        "rotate": args.rotate,
+        "metrics": {k: float(v) for k, v in metric_vals.items()},
+        **getattr(args, "quant_stats", {}),
+    }
+    os.makedirs(os.path.dirname(args.metrics_path), exist_ok=True)
+    with open(args.metrics_path, "w") as f:
+        json.dump(record, f, indent=2)
+    logging.info(f"Wrote metrics to {args.metrics_path}")
+
+
+def save_dequant_model(args, analyzer):
+    """Save the fake-quantized weights as an ordinary BF16 checkpoint (vLLM-servable).
+
+    The quantizers write dequantized values back into each Linear's weight, so a plain
+    save_pretrained() gives a model whose outputs match the quantized model exactly; the
+    storage size is accounted for separately (ours/size/bpw.py).
+    """
+    from gptq_utils.bits_map import describe
+    logging.info(f"Saving dequantized model to {args.dequant_path}")
+    quant_utils.remove_actquant(analyzer)
+    analyzer.recover_tie_word_embeddings()
+    os.makedirs(args.dequant_path, exist_ok=True)
+    analyzer.model.save_pretrained(args.dequant_path, safe_serialization=True)
+    analyzer.tokenizer.save_pretrained(args.dequant_path)
+    if getattr(analyzer, "processor", None) is not None:
+        analyzer.processor.save_pretrained(args.dequant_path)
+    with open(os.path.join(args.dequant_path, "g2ptq_quant_info.json"), "w") as f:
+        json.dump({"source_model": args.model, "exp": args.exp, "w_method": args.w_method,
+                   "settings": describe(args)}, f, indent=2)
 
 
 if __name__ == "__main__":

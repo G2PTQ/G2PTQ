@@ -1,4 +1,6 @@
 import copy
+from gptq_utils.bits_map import drop_unquantized, bits_key_fn, spec_bits, spec_groupsize, chunk_qconf
+from gptq_utils import token_weights
 import logging
 import os
 import math
@@ -614,6 +616,8 @@ class SaliencyCache:
 
         grad_squared = grad.float().pow(2).view(n_tokens, self.num_groups, group_size)
         mean_squared_grad = grad_squared.mean(dim=-1)  # -> [n_tokens, num_groups]
+        # Token importance: H' = sum_t w_t F_t (no-op when no weights are loaded)
+        mean_squared_grad = token_weights.apply_flat(mean_squared_grad, name=name)
 
         self.saliency_cache[name].setdefault(loss_type, []).append(mean_squared_grad)
 
@@ -992,6 +996,9 @@ def compute_kl_grad_hessian(logits, logits_fp, saliency_cache, gradients_cache, 
         F.softmax(logits_fp, dim=-1),
         reduction="none",
     )
+    if token_weights.current() is not None:
+        # Token importance: g' = grad of sum_t w_t KL_t
+        kl_loss = token_weights.apply_flat(kl_loss.sum(-1).reshape(-1), name="kl_loss")
     kl_loss = kl_loss.sum()
     if compute_gradient:
         offload_utils.zero_onloaded_grads()
@@ -1026,7 +1033,9 @@ def compute_mse_grad_hessian(hidden_states, hidden_states_fp, saliency_cache, gr
         hidden_states.view(-1, hidden_states.size(-1)),
         hidden_states_fp.view(-1, hidden_states.size(-1)),
         reduction="none",
-    ).mean(-1).sum() / 2
+    ).mean(-1)
+    # Token importance: g' = grad of sum_t w_t MSE_t (no-op when no weights are loaded)
+    mse_loss = token_weights.apply_flat(mse_loss, name="mse_loss").sum() / 2
     if compute_gradient:
         offload_utils.zero_onloaded_grads()
         with gradients_cache.set_backward_hook(full, loss_type=loss_type):
@@ -1291,6 +1300,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             ncols=120, desc=f"Layer {i} Computing Gradients and Hessians",
                             position=1, leave=False
                         ):
+                            token_weights.set_batch(j, args.bsz, dev)
                             out = model_utils.run_block_layer(
                                 analyzer, layer, inps_batch,
                                 prev_topk_indices=topk_batch,
@@ -1360,6 +1370,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                                 del logits, logits_fp
                             # memory_utils.cleanup_memory()     # reduce memory but slow down the quantization
 
+                    token_weights.clear_batch()
                     offload_utils.zero_onloaded_grads()
                     memory_utils.cleanup_memory()
                     mean_losses = {lt: sum(vals).item() / len(vals) for lt, vals in losses.items()}
@@ -1389,11 +1400,13 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                 #############################################################################
 
                 subset = {n: full.get(n, full.get(n + ".module", None)) for n in names}
+                subset = drop_unquantized(subset, args)  # 16-bit modules stay in BF16
 
-                specs = build_chunk_specs(subset, args.layer_bsz, group_key_fn=name2stage.__getitem__)
+                specs = build_chunk_specs(subset, args.layer_bsz,
+                                          group_key_fn=bits_key_fn(args, name2stage.__getitem__))
                 if world_size > 1:
                     specs, rank2spec, spec2rank = partition_layers(specs, world_size)
-                onload_bsz = len(specs) if args.onload_gptq_bsz <= 0 else args.onload_gptq_bsz
+                onload_bsz = max(1, len(specs)) if args.onload_gptq_bsz <= 0 else args.onload_gptq_bsz
 
                 gptqs, gptqs_partition = [], []
                 gptq2rank, gptq2chunk_names = {}, {}
@@ -1418,14 +1431,14 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                         )
                         quantizer = quant_utils.WeightQuantizer()
                         quantizer.configure(
-                            args.w_bits,
+                            spec_bits(spec, args),
                             perchannel=True,
                             sym=not (args.w_asym),
                             mse=args.w_clip,
                             hclip=args.w_hclip,
                         )
                         gptq.quantizer = make_group_quantizers(
-                            quantizer, spec.columns, args.w_groupsize
+                            quantizer, spec.columns, spec_groupsize(spec, args)
                         )
                         gptqs_batch.append(gptq)
                         gptq2chunk_names[gptq] = spec.chunk_names
@@ -1491,7 +1504,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     ):
                         alpha = float(f"{alpha.item():.2f}")
                         for gptq in gptqs_partition:
-                            layer_w_groupsize = args.w_groupsize
+                            layer_w_groupsize = chunk_qconf(gptq2chunk_names[gptq], args)[1]
                             gptq.fasterquant(
                                 percdamp=args.percdamp,
                                 groupsize=layer_w_groupsize,
@@ -1580,7 +1593,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     chunk_names = gptq2chunk_names[gptq]
                     display_name = chunk_names[0] + (f" (+{len(chunk_names)-1} batched)" if len(chunk_names) > 1 else "")
                     pbar.set_postfix(module=f"layers.{i}.{display_name}", alpha=f"{alpha:.2e}", loss=f"{mean_loss:.2e}")
-                    layer_w_groupsize = args.w_groupsize
+                    layer_w_groupsize = chunk_qconf(chunk_names, args)[1]
                     gptq.fasterquant(
                         percdamp=args.percdamp,
                         groupsize=layer_w_groupsize,
@@ -1600,7 +1613,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             gptq.quantizer,
                             idx * rows,
                             (idx + 1) * rows,
-                            args.w_groupsize,
+                            layer_w_groupsize,
                         )
                         
                     gptq.free()

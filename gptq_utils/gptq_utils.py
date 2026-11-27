@@ -1,4 +1,5 @@
 import copy
+from gptq_utils.bits_map import drop_unquantized, qconf_for, bits_key_fn, spec_bits, spec_groupsize, chunk_qconf
 import logging
 import math
 import pprint
@@ -459,11 +460,12 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
             full = analyzer.get_quantizable_modules(layer)
             for names in sequential:
                 subset = {n: full.get(n, full.get(n + ".module", None)) for n in names}
+                subset = drop_unquantized(subset, args)  # 16-bit modules stay in BF16
 
-                specs = build_chunk_specs(subset, args.layer_bsz)
+                specs = build_chunk_specs(subset, args.layer_bsz, group_key_fn=bits_key_fn(args))
                 if world_size > 1:
                     specs, rank2spec, spec2rank = partition_layers(specs, world_size)
-                onload_bsz = len(specs) if args.onload_gptq_bsz <= 0 else args.onload_gptq_bsz
+                onload_bsz = max(1, len(specs)) if args.onload_gptq_bsz <= 0 else args.onload_gptq_bsz
 
                 gptqs, gptqs_partition = [], []
                 gptq2rank, gptq2chunk_names = {}, {}
@@ -480,14 +482,14 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                                     offload_hessians=args.offload_hessians)
                         quantizer = quant_utils.WeightQuantizer()
                         quantizer.configure(
-                            args.w_bits,
+                            spec_bits(spec, args),
                             perchannel=True,
                             sym=not (args.w_asym),
                             mse=args.w_clip,
                             hclip=args.w_hclip,
                         )
                         gptq.quantizer = make_group_quantizers(
-                            quantizer, spec.columns, args.w_groupsize
+                            quantizer, spec.columns, spec_groupsize(spec, args)
                         )
                         gptqs_batch.append(gptq)
                         gptq2chunk_names[gptq] = spec.chunk_names
@@ -539,7 +541,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                     chunk_names = gptq2chunk_names[gptq]
                     display_name = chunk_names[0] + (f" (+{len(chunk_names)-1} batched)" if len(chunk_names) > 1 else "")
                     pbar.set_postfix(module=f"layers.{i}.{display_name}")
-                    layer_w_groupsize = args.w_groupsize
+                    layer_w_groupsize = chunk_qconf(chunk_names, args)[1]
                     gptq.fasterquant(
                         percdamp=args.percdamp,
                         groupsize=layer_w_groupsize,
@@ -557,7 +559,7 @@ def gptq_fwrd(args, analyzer: model_utils.ModelAnalyzer, dataloader, dev):
                             gptq.quantizer,
                             idx * rows,
                             (idx + 1) * rows,
-                            args.w_groupsize,
+                            layer_w_groupsize,
                         )
 
                     gptq.free()
@@ -608,15 +610,14 @@ def rtn_fwrd(args, analyzer: model_utils.ModelAnalyzer, dev):
             sequential = analyzer.get_sequential_quantizable_module_names(layer)
             names = [n for ns in sequential for n in ns]
             subset = {n: full.get(n, full.get(n + ".module", None)) for n in names}
+            subset = drop_unquantized(subset, args)  # 16-bit modules stay in BF16
 
             groups = defaultdict(list)
             for name in subset:
                 shape = subset[name].weight.shape
-                groups[shape].append(name)
+                groups[(shape, qconf_for(name, args))].append(name)
 
-            for shape, group_names in groups.items():
-                layer_weight_bits = args.w_bits
-                w_groupsize = args.w_groupsize
+            for (shape, (layer_weight_bits, w_groupsize)), group_names in groups.items():
                 # Split the group into batches
                 for chunk_start in range(0, len(group_names), args.layer_bsz):
                     chunk_names = group_names[chunk_start: chunk_start + args.layer_bsz]

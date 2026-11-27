@@ -1,0 +1,8 @@
+# Evaluation / generation environment (separate from requirements.txt because vLLM pins its own torch).
+# Also install a vLLM release that supports Qwen3.5.
+lm-eval==0.4.4
+datasets
+langdetect
+immutabledict
+nltk>=3.9.1
+setuptools<81   # lm-eval's IFEval checkers import pkg_resources

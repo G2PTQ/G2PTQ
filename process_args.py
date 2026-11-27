@@ -6,6 +6,7 @@ import transformers
 import torch
 
 from utils import dist_utils
+from gptq_utils.bits_map import parse_bits_map
 from utils.datasets import get_dataset_names
 from utils.log_utils import init_logging
 
@@ -38,6 +39,15 @@ def parse_gen():
     parser.add_argument("--k_bits", type=int, default=16, help="K cache bits")
     parser.add_argument("--v_bits", type=int, default=16, help="V cache bits")
     parser.add_argument("--w_groupsize", type=int, default=-1, help="Weight group size")
+    parser.add_argument("--w_bits_map", type=str, default=None,
+                        help="Per-module bits: JSON {regex: bits} (or path to .json), matched against "
+                             "layer-relative module names; unmatched modules use --w_bits")
+    parser.add_argument("--token_weights", type=str, default=None,
+                        help="Per-token importance weights (.pt from ours/token_weights/compute_token_weights.py) "
+                             "applied to the G2PTQ Hessian and block loss")
+    parser.add_argument("--save_dequant_model", action="store_true",
+                        help="Save the fake-quantized (dequantized) model as a plain BF16 HF checkpoint "
+                             "to <output_dir>/dequant_model, e.g. for vLLM evaluation of 3-bit/mixed models")
     parser.add_argument("--a_groupsize", type=int, default=-1, help="Activation group size")
     parser.add_argument("--k_groupsize", type=int, default=-1, help="K cache group size")
     parser.add_argument("--v_groupsize", type=int, default=-1, help="V cache group size")
@@ -142,6 +152,20 @@ def parse_gen():
 
     args = parser.parse_args()
 
+    try:
+        args.w_bits_map = parse_bits_map(args.w_bits_map)
+    except ValueError as e:
+        parser.error(str(e))
+    if args.w_bits_map is not None and args.w_method not in {"rtn", "gptq", "g2ptq"}:
+        parser.error("--w_bits_map is only implemented for --w_method rtn, gptq and g2ptq")
+    if args.token_weights is not None:
+        if args.w_method != "g2ptq":
+            parser.error("--token_weights is only implemented for --w_method g2ptq")
+        if not os.path.isfile(args.token_weights):
+            parser.error(f"--token_weights file not found: {args.token_weights}")
+        if args.moe_gate_align:
+            parser.error("--token_weights does not support --moe_gate_align")
+
     if args.autotune and args.load_autotune:
         parser.error(
             "--autotune and --load_autotune are mutually exclusive: the search would overwrite "
@@ -177,7 +201,15 @@ def parse_gen():
                               f"{args.model_name}-{args.dataset}_s{args.nsamples}_blk{args.seq_len}.pt")
     args.autotune_cache_path = os.path.join(args.output_dir, "autotune.json")
     args.export_path = os.path.join(args.output_dir, "export_model")
+    args.dequant_path = os.path.join(args.output_dir, "dequant_model")
+    args.metrics_path = os.path.join(args.output_dir, "metrics.json")
+    if args.save_dequant_model and args.export_compressed_tensors:
+        raise ValueError("Use either --save_dequant_model or --export_compressed_tensors, not both.")
+    if args.save_dequant_model and args.rotate and not args.disable_online_rot:
+        raise ValueError("--save_dequant_model needs an unrotated model (or --disable_online_rot): "
+                         "online Hadamard rotations cannot be stored in a plain HF checkpoint.")
     if args.export_compressed_tensors:
+        assert args.w_bits_map is None, "Mixed-bit (--w_bits_map) export is not supported; evaluate a dequantized BF16 checkpoint instead."
         assert not args.w_asym and (args.w_bits in [4, 8]), "Currently, only the export of 4/8-bit symmetrically quantized models is supported."
         assert (not args.rotate) or args.disable_online_rot, "Online rotations are not supportded in inference engines."
     if args.num_groups is not None:
